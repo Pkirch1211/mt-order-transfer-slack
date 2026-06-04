@@ -2,19 +2,18 @@ name: MT → Shopify Daily Digest
 
 on:
   schedule:
-    # 5:00 PM EST = 22:00 UTC  |  5:00 PM EDT = 21:00 UTC
-    # Running at 22:00 UTC covers EST (Nov–Mar). Change to 21:00 in summer or just run both:
+    # 5:00 PM EST = 22:00 UTC (adjust to 21:00 during EDT / summer)
     - cron: "0 22 * * 1-5"   # Weekdays only — change "1-5" to "*" for all days
   workflow_dispatch:
     inputs:
       lookback_days:
-        description: "Days back to scan (default 1 — use 7 to backfill September gap)"
+        description: "Days back to scan (default 1 — use 90 to surface the September gap)"
         required: false
         default: "1"
 
 jobs:
   digest:
-    name: Send MT→Shopify Digest to Slack
+    name: Send MT→Shopify Digest Email
     runs-on: ubuntu-latest
 
     steps:
@@ -35,10 +34,12 @@ jobs:
       - name: Run digest
         working-directory: scripts/mt-digest
         env:
-          MT_API_KEY:        ${{ secrets.MT_API_KEY }}
-          MT_WHOAMI:         ${{ secrets.MT_WHOAMI }}
-          SHOPIFY_STORE:     ${{ secrets.SHOPIFY_STORE }}
-          SHOPIFY_TOKEN:     ${{ secrets.SHOPIFY_TOKEN }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          LOOKBACK_DAYS:     ${{ github.event.inputs.lookback_days || '1' }}
+          MT_API_KEY:         ${{ secrets.MT_API_KEY }}
+          MT_WHOAMI:          ${{ secrets.MT_WHOAMI }}
+          SHOPIFY_STORE:      ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_TOKEN:      ${{ secrets.SHOPIFY_TOKEN }}
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RECIPIENT_EMAIL:    ${{ secrets.RECIPIENT_EMAIL }}
+          LOOKBACK_DAYS:      ${{ github.event.inputs.lookback_days || '1' }}
         run: node digest.js

@@ -1,14 +1,14 @@
 {
   "name": "mt-digest",
   "version": "1.0.0",
-  "description": "Daily MT → Shopify transfer digest to Slack",
+  "description": "Daily MT → Shopify transfer digest via email",
   "main": "digest.js",
   "type": "module",
   "scripts": {
     "start": "node digest.js"
   },
   "dependencies": {
-    "@slack/webhook": "^7.0.9",
+    "nodemailer": "^6.9.13",
     "node-fetch": "^3.3.2"
   },
   "engines": {

@@ -1,36 +1,40 @@
 /**
- * LifeLines — Daily MT → Shopify Transfer Digest
+ * LifeLines — Daily MT → Shopify Transfer Digest (Email)
  *
  * Fetches all MT orders via POST /orders/get (paginated, mirrors Python script exactly).
  * Filters to orders whose orderDate falls within the lookback window.
  * For each order, checks Shopify for a matching draft order via:
  *   1. Tag:       mt_recordID:{recordID}          (primary — written by your import script)
  *   2. Metafield: mktt.recordid = {recordID}      (fallback)
- * Posts a table to Slack channel #mt-order-transfer at 5 PM EST.
+ * Sends an HTML summary email via Gmail at 5 PM EST.
  *
  * Required env vars / GitHub Secrets:
- *   MT_API_KEY        — x-api-key header value for MarketTime
- *   MT_WHOAMI         — rep group segment, e.g. M743553
- *   SHOPIFY_STORE     — your-store.myshopify.com
- *   SHOPIFY_TOKEN     — Shopify Admin API token
- *   SLACK_WEBHOOK_URL — Incoming webhook URL for #mt-order-transfer
- *   LOOKBACK_DAYS     — optional, defaults to 1
+ *   MT_API_KEY          — x-api-key header value for MarketTime
+ *   MT_WHOAMI           — rep group segment, e.g. M743553
+ *   SHOPIFY_STORE       — your-store.myshopify.com
+ *   SHOPIFY_TOKEN       — Shopify Admin API token
+ *   GMAIL_USER          — Gmail address used to send (and receive)
+ *   GMAIL_APP_PASSWORD  — Gmail App Password (not your login password)
+ *   RECIPIENT_EMAIL     — optional, defaults to GMAIL_USER
+ *   LOOKBACK_DAYS       — optional, defaults to 1
  */
 
 import fetch from "node-fetch";
-import { IncomingWebhook } from "@slack/webhook";
+import nodemailer from "nodemailer";
 
 // ── Config ────────────────────────────────────────────────────────────────────
-const MT_API_KEY        = process.env.MT_API_KEY;
-const MT_WHOAMI         = process.env.MT_WHOAMI;
-const SHOPIFY_STORE     = process.env.SHOPIFY_STORE;
-const SHOPIFY_TOKEN     = process.env.SHOPIFY_TOKEN;
-const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
-const LOOKBACK_DAYS     = parseInt(process.env.LOOKBACK_DAYS || "1", 10);
-const MT_BATCH          = 50;   // mirrors SERVER_LIMIT in Python
-const SHOPIFY_API       = "2024-10";
+const MT_API_KEY         = process.env.MT_API_KEY;
+const MT_WHOAMI          = process.env.MT_WHOAMI;
+const SHOPIFY_STORE      = process.env.SHOPIFY_STORE;
+const SHOPIFY_TOKEN      = process.env.SHOPIFY_TOKEN;
+const GMAIL_USER         = process.env.GMAIL_USER;
+const GMAIL_APP_PASSWORD = process.env.GMAIL_APP_PASSWORD;
+const RECIPIENT_EMAIL    = process.env.RECIPIENT_EMAIL || GMAIL_USER;
+const LOOKBACK_DAYS      = parseInt(process.env.LOOKBACK_DAYS || "1", 10);
+const MT_BATCH           = 50;
+const SHOPIFY_API        = "2024-10";
 
-for (const [k, v] of Object.entries({ MT_API_KEY, MT_WHOAMI, SHOPIFY_STORE, SHOPIFY_TOKEN, SLACK_WEBHOOK_URL })) {
+for (const [k, v] of Object.entries({ MT_API_KEY, MT_WHOAMI, SHOPIFY_STORE, SHOPIFY_TOKEN, GMAIL_USER, GMAIL_APP_PASSWORD })) {
   if (!v) throw new Error(`Missing required env var: ${k}`);
 }
 
@@ -95,7 +99,6 @@ async function fetchAllMTOrders() {
 
     let added = 0;
     for (const o of batch) {
-      // Deduplication key mirrors Python: recordID or composite fallback
       const key = o.recordID ?? `${o.poNumber}|${o.retailerID}|${o.orderDate}`;
       if (!seen.has(String(key))) {
         seen.add(String(key));
@@ -118,10 +121,6 @@ async function fetchAllMTOrders() {
 }
 
 // ── 2. Shopify draft order lookup ─────────────────────────────────────────────
-// Primary:  GraphQL tag query  tag:"mt_recordID:{id}"
-// Fallback: GraphQL metafield  namespace=mktt key=recordid value={id}
-// Returns draft order name string (e.g. "#D1001") if found, null if not.
-
 const shopifyHeaders = {
   "X-Shopify-Access-Token": SHOPIFY_TOKEN,
   "Content-Type":           "application/json",
@@ -133,21 +132,17 @@ async function shopifyGQL(query, variables = {}) {
     { method: "POST", headers: shopifyHeaders, body: JSON.stringify({ query, variables }) }
   );
   const json = await res.json();
-  if (json.errors?.length) {
-    console.warn("[Shopify GQL errors]", JSON.stringify(json.errors));
-  }
+  if (json.errors?.length) console.warn("[Shopify GQL errors]", JSON.stringify(json.errors));
   return json;
 }
 
-// Per-run cache: recordID string → draft name string | null
 const _draftCache = new Map();
 
 async function findDraftByRecordID(recordID) {
   const id = String(recordID);
   if (_draftCache.has(id)) return _draftCache.get(id);
 
-  // ── Strategy 1: tag search (exact match on mt_recordID:{id}) ──────────────
-  // This is what your import script writes, so it will match the vast majority.
+  // Strategy 1: tag match — mt_recordID:{id}
   try {
     const data = await shopifyGQL(
       `query($q: String!) {
@@ -158,7 +153,6 @@ async function findDraftByRecordID(recordID) {
       { q: `tag:"mt_recordID:${id}"` }
     );
     for (const { node } of data?.data?.draftOrders?.edges ?? []) {
-      // tags is a string[] in the Admin API
       const tags = Array.isArray(node.tags)
         ? node.tags
         : String(node.tags ?? "").split(",").map(t => t.trim());
@@ -168,13 +162,10 @@ async function findDraftByRecordID(recordID) {
       }
     }
   } catch (err) {
-    console.warn(`[Shopify] Tag search failed for recordID ${id}: ${err.message}`);
+    console.warn(`[Shopify] Tag search failed for ${id}: ${err.message}`);
   }
 
-  // ── Strategy 2: metafield fallback (mktt.recordid) ────────────────────────
-  // Shopify GraphQL doesn't allow filtering draftOrders by metafield value,
-  // so we search recent "markettime"-tagged drafts and inspect metafields.
-  // This catches any order created via a path that writes the metafield instead of the tag.
+  // Strategy 2: metafield fallback — mktt.recordid
   try {
     const data = await shopifyGQL(
       `query($q: String!) {
@@ -192,16 +183,16 @@ async function findDraftByRecordID(recordID) {
       { q: `tag:markettime` }
     );
     for (const { node } of data?.data?.draftOrders?.edges ?? []) {
-      const mfMatch = (node.metafields?.nodes ?? []).find(
+      const match = (node.metafields?.nodes ?? []).find(
         m => m.key === "recordid" && String(m.value) === id
       );
-      if (mfMatch) {
+      if (match) {
         _draftCache.set(id, node.name);
         return node.name;
       }
     }
   } catch (err) {
-    console.warn(`[Shopify] Metafield fallback failed for recordID ${id}: ${err.message}`);
+    console.warn(`[Shopify] Metafield fallback failed for ${id}: ${err.message}`);
   }
 
   _draftCache.set(id, null);
@@ -217,10 +208,8 @@ function cutoffDate(daysBack) {
 }
 
 async function buildRows(allMTOrders) {
-  const cutoff = cutoffDate(LOOKBACK_DAYS);
-
-  // Filter to orders in the lookback window by orderDate
-  const inWindow = allMTOrders.filter(o => {
+  const cutoff    = cutoffDate(LOOKBACK_DAYS);
+  const inWindow  = allMTOrders.filter(o => {
     if (!o.orderDate) return false;
     try { return new Date(o.orderDate) >= cutoff; } catch { return false; }
   });
@@ -229,31 +218,30 @@ async function buildRows(allMTOrders) {
 
   const rows = [];
   for (let i = 0; i < inWindow.length; i++) {
-    const o          = inWindow[i];
-    const recordID   = o.recordID;
-    const draftName  = recordID ? await findDraftByRecordID(String(recordID)) : null;
+    const o         = inWindow[i];
+    const recordID  = o.recordID;
+    const draftName = recordID ? await findDraftByRecordID(String(recordID)) : null;
 
     rows.push({
       seq:         i + 1,
-      mtPO:        String(o.poNumber    ?? "—"),
-      company:     String(o.billToName  ?? "—"),
+      mtPO:        String(o.poNumber   ?? "—"),
+      company:     String(o.billToName ?? "—"),
       mtStatus:    String(o.manufacturerOrderStatus ?? "—"),
       transferred: draftName !== null,
       draftName,
       recordID:    String(recordID ?? "—"),
     });
 
-    // Light throttle every 10 Shopify calls
     if (i > 0 && i % 10 === 0) await sleep(250);
   }
 
   return rows;
 }
 
-// ── 4. Format Slack message ───────────────────────────────────────────────────
-function buildSlackMessage(rows) {
+// ── 4. Build HTML email ───────────────────────────────────────────────────────
+function buildEmail(rows) {
   const now = new Date().toLocaleDateString("en-US", {
-    weekday: "long", month: "short", day: "numeric",
+    weekday: "long", year: "numeric", month: "long", day: "numeric",
     timeZone: "America/New_York",
   });
 
@@ -262,98 +250,107 @@ function buildSlackMessage(rows) {
   const missingRows = rows.filter(r => !r.transferred);
   const allGood     = missingRows.length === 0;
 
-  // ── No orders in window ───────────────────────────────────────────────────
-  if (total === 0) {
-    return {
-      text: `✅ MT→Shopify Digest — ${now}: No orders in window.`,
-      blocks: [
-        {
-          type: "header",
-          text: { type: "plain_text", text: `✅ MT→Shopify Daily Digest — ${now}`, emoji: true },
-        },
-        {
-          type: "section",
-          text: { type: "mrkdwn", text: `No MarketTime orders found in the last ${LOOKBACK_DAYS} day(s).` },
-        },
-      ],
-    };
-  }
+  const subject = total === 0
+    ? `✅ [LifeLines] MT→Shopify Digest — No orders today`
+    : allGood
+      ? `✅ [LifeLines] MT→Shopify Digest — All ${total} order(s) transferred`
+      : `🚨 [LifeLines] MT→Shopify Digest — ${missingRows.length} MISSING order(s)`;
 
-  // ── Fixed-width table in a code block ────────────────────────────────────
-  // Columns match the screenshot exactly: # | MT PO | Company | MT Status | Y/N
-  const W = { seq: 3, po: 14, company: 26, status: 10, yn: 3 };
-
-  const pad = (s, w) => String(s ?? "").slice(0, w).padEnd(w);
-  const trunc = (s, w) => {
-    const str = String(s ?? "");
-    return str.length > w ? str.slice(0, w - 1) + "…" : str.padEnd(w);
+  // ── Styles ──────────────────────────────────────────────────────────────────
+  const s = {
+    body:      "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#1e293b;max-width:700px;margin:0 auto;padding:32px 16px;",
+    h2:        "margin:0 0 4px;font-size:20px;",
+    sub:       "color:#64748b;margin:0 0 24px;font-size:14px;",
+    banner_ok: "background:#f0fdf4;border:1px solid #86efac;border-radius:8px;padding:14px 18px;margin-bottom:24px;color:#166534;font-weight:600;",
+    banner_er: "background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:14px 18px;margin-bottom:24px;",
+    table:     "width:100%;border-collapse:collapse;border:1px solid #e2e8f0;border-radius:8px;overflow:hidden;font-size:14px;",
+    th:        "padding:10px 14px;background:#f8fafc;font-size:11px;font-weight:700;text-transform:uppercase;color:#64748b;text-align:left;border-bottom:1px solid #e2e8f0;",
+    td:        "padding:10px 14px;border-bottom:1px solid #f1f5f9;",
+    td_ok:     "padding:10px 14px;border-bottom:1px solid #f1f5f9;color:#16a34a;font-weight:700;",
+    td_miss:   "padding:10px 14px;border-bottom:1px solid #f1f5f9;color:#dc2626;font-weight:700;",
+    footer:    "font-size:12px;color:#94a3b8;margin-top:16px;",
+    alert_h:   "margin:0 0 10px;font-size:15px;color:#991b1b;",
+    alert_box: "background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:16px 20px;margin-top:24px;",
+    alert_li:  "margin:4px 0;font-size:14px;color:#7f1d1d;font-family:monospace;",
   };
 
-  const divider = "─".repeat(W.seq + W.po + W.company + W.status + W.yn + 4 * 3);
+  // ── Banner ───────────────────────────────────────────────────────────────────
+  let banner = "";
+  if (total === 0) {
+    banner = `<div style="${s.banner_ok}">✅ No MarketTime orders found in the last ${LOOKBACK_DAYS} day(s).</div>`;
+  } else if (allGood) {
+    banner = `<div style="${s.banner_ok}">✅ All ${total} order(s) transferred to Shopify successfully.</div>`;
+  } else {
+    banner = `<div style="${s.banner_er}">
+      <strong style="color:#991b1b;">🚨 ${missingRows.length} order(s) marked in MarketTime but NOT found in Shopify.</strong>
+      <p style="margin:6px 0 0;color:#7f1d1d;font-size:14px;">These orders may have been missed by the transfer flow. Investigate immediately.</p>
+    </div>`;
+  }
 
-  const headerRow = [
-    pad("#",         W.seq),
-    pad("MT PO",     W.po),
-    pad("Company",   W.company),
-    pad("MT Status", W.status),
-    pad("✓",         W.yn),
-  ].join(" │ ");
+  // ── Table rows ───────────────────────────────────────────────────────────────
+  const tableRows = rows.map(r => `
+    <tr style="background:${r.transferred ? "#fff" : "#fff5f5"}">
+      <td style="${s.td}">${r.seq}</td>
+      <td style="${s.td}">${r.mtPO}</td>
+      <td style="${s.td}">${r.company}</td>
+      <td style="${s.td}">${r.mtStatus}</td>
+      <td style="${r.transferred ? s.td_ok : s.td_miss}">${r.transferred ? "Y" : "N"}</td>
+      <td style="${s.td};color:#94a3b8;font-size:12px;">${r.draftName ?? "—"}</td>
+    </tr>`).join("");
 
-  const dataRows = rows.map(r => [
-    pad(r.seq,      W.seq),
-    trunc(r.mtPO,    W.po),
-    trunc(r.company, W.company),
-    trunc(r.mtStatus, W.status),
-    pad(r.transferred ? "Y" : "N", W.yn),
-  ].join(" │ "));
-
-  const table = ["```", headerRow, divider, ...dataRows, "```"].join("\n");
-
-  // ── Summary line ──────────────────────────────────────────────────────────
-  const summaryEmoji = allGood ? "✅" : "🚨";
-  const summaryText  = allGood
-    ? `All *${total}* order(s) transferred to Shopify successfully.`
-    : `*${missingRows.length}* of ${total} order(s) not found in Shopify — action required.`;
-
-  const blocks = [
-    {
-      type: "header",
-      text: {
-        type: "plain_text",
-        text: `${summaryEmoji} MT→Shopify Daily Digest — ${now}`,
-        emoji: true,
-      },
-    },
-    {
-      type: "section",
-      text: { type: "mrkdwn", text: summaryText },
-    },
-    { type: "divider" },
-    {
-      type: "section",
-      text: { type: "mrkdwn", text: table },
-    },
-  ];
+  const table = total === 0 ? "" : `
+    <table style="${s.table}">
+      <thead>
+        <tr>
+          <th style="${s.th}">#</th>
+          <th style="${s.th}">MT PO</th>
+          <th style="${s.th}">Company</th>
+          <th style="${s.th}">MT Status</th>
+          <th style="${s.th}">Transferred</th>
+          <th style="${s.th}">Shopify Draft #</th>
+        </tr>
+      </thead>
+      <tbody>${tableRows}</tbody>
+    </table>
+    <p style="${s.footer}">${okCount} of ${total} order(s) confirmed in Shopify</p>`;
 
   // ── Alert block for missing orders ────────────────────────────────────────
-  if (missingRows.length > 0) {
-    const lines = missingRows.map(r =>
-      `• PO \`${r.mtPO}\` — ${r.company}  _(recordID: ${r.recordID})_`
-    );
-    blocks.push({ type: "divider" });
-    blocks.push({
-      type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `*⚠️ Orders not found in Shopify — investigate:*\n${lines.join("\n")}`,
-      },
-    });
-  }
+  const alertBlock = missingRows.length === 0 ? "" : `
+    <div style="${s.alert_box}">
+      <p style="${s.alert_h}">⚠️ Orders not found in Shopify — investigate:</p>
+      <ul style="margin:0;padding-left:18px;">
+        ${missingRows.map(r => `<li style="${s.alert_li}">PO ${r.mtPO} — ${r.company} (recordID: ${r.recordID})</li>`).join("")}
+      </ul>
+    </div>`;
 
-  return {
-    text: `${summaryEmoji} MT→Shopify Digest — ${now} | ${okCount}/${total} transferred`,
-    blocks,
-  };
+  const html = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"></head>
+<body style="${s.body}">
+  <h2 style="${s.h2}">LifeLines — MT→Shopify Daily Digest</h2>
+  <p style="${s.sub}">${now}</p>
+  ${banner}
+  ${table}
+  ${alertBlock}
+</body></html>`;
+
+  return { subject, html };
+}
+
+// ── 5. Send email ─────────────────────────────────────────────────────────────
+async function sendEmail(subject, html) {
+  const transporter = nodemailer.createTransport({
+    service: "gmail",
+    auth: { user: GMAIL_USER, pass: GMAIL_APP_PASSWORD },
+  });
+
+  await transporter.sendMail({
+    from:    `"LifeLines Ops" <${GMAIL_USER}>`,
+    to:      RECIPIENT_EMAIL,
+    subject,
+    html,
+  });
+
+  console.log(`[Digest] ✅ Email sent: "${subject}"`);
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -362,18 +359,14 @@ async function main() {
 
   const allOrders = await fetchAllMTOrders();
   const rows      = await buildRows(allOrders);
-  const message   = buildSlackMessage(rows);
+  const { subject, html } = buildEmail(rows);
+
+  await sendEmail(subject, html);
 
   const missing = rows.filter(r => !r.transferred).length;
-  console.log(`[Digest] Rows: ${rows.length} total, ${rows.length - missing} transferred, ${missing} missing`);
-
-  const webhook = new IncomingWebhook(SLACK_WEBHOOK_URL);
-  await webhook.send(message);
-  console.log("[Digest] ✅ Slack message sent.");
-
   if (missing > 0) {
     console.error(`[Digest] ❌ ${missing} order(s) not found in Shopify.`);
-    process.exit(1);  // Makes the Actions run go red for missing orders
+    process.exit(1);
   }
 }
 
