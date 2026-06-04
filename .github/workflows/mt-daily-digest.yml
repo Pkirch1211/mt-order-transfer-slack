@@ -29,7 +29,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: scripts/mt-digest
-        run: npm ci
+        run: npm install
 
       - name: Run digest
         working-directory: scripts/mt-digest
