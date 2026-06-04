@@ -1,0 +1,44 @@
+name: MT → Shopify Daily Digest
+
+on:
+  schedule:
+    # 5:00 PM EST = 22:00 UTC  |  5:00 PM EDT = 21:00 UTC
+    # Running at 22:00 UTC covers EST (Nov–Mar). Change to 21:00 in summer or just run both:
+    - cron: "0 22 * * 1-5"   # Weekdays only — change "1-5" to "*" for all days
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: "Days back to scan (default 1 — use 7 to backfill September gap)"
+        required: false
+        default: "1"
+
+jobs:
+  digest:
+    name: Send MT→Shopify Digest to Slack
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: scripts/mt-digest/package.json
+
+      - name: Install dependencies
+        working-directory: scripts/mt-digest
+        run: npm ci
+
+      - name: Run digest
+        working-directory: scripts/mt-digest
+        env:
+          MT_API_KEY:        ${{ secrets.MT_API_KEY }}
+          MT_WHOAMI:         ${{ secrets.MT_WHOAMI }}
+          SHOPIFY_STORE:     ${{ secrets.SHOPIFY_STORE }}
+          SHOPIFY_TOKEN:     ${{ secrets.SHOPIFY_TOKEN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          LOOKBACK_DAYS:     ${{ github.event.inputs.lookback_days || '1' }}
+        run: node digest.js
