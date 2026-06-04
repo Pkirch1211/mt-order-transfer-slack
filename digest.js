@@ -344,7 +344,7 @@ async function sendEmail(subject, html) {
   });
 
   await transporter.sendMail({
-    from:    `"LifeLines Ops" <${GMAIL_USER}>`,
+    from:    `"${process.env.GMAIL_FROM || "LifeLines Ops"}" <${GMAIL_USER}>`,
     to:      RECIPIENT_EMAIL,
     subject,
     html,
