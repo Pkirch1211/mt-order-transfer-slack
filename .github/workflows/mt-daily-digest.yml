@@ -40,6 +40,6 @@ jobs:
           SHOPIFY_TOKEN:      ${{ secrets.SHOPIFY_TOKEN }}
           GMAIL_USER:         ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          RECIPIENT_EMAIL:    ${{ secrets.RECIPIENT_EMAIL }}
+          RECIPIENT_EMAIL:    ${{ vars.RECIPIENT_EMAIL }}
           LOOKBACK_DAYS:      ${{ github.event.inputs.lookback_days || '1' }}
         run: node digest.js
