@@ -1,36 +1,29 @@
 name: MT → Shopify Daily Digest
-
 on:
   schedule:
-    # 5:00 PM EST = 22:00 UTC (adjust to 21:00 during EDT / summer)
-    - cron: "0 22 * * 1-5"   # Weekdays only — change "1-5" to "*" for all days
+    - cron: "0 20 * * 1,3,5"   # Mon, Wed, Fri at 5 PM EDT
   workflow_dispatch:
     inputs:
       lookback_days:
-        description: "Days back to scan (default 1 — use 90 to surface the September gap)"
+        description: "Days back to scan (default 3)"
         required: false
-        default: "1"
-
+        default: "3"
 jobs:
   digest:
     name: Send MT→Shopify Digest Email
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: "npm"
           cache-dependency-path: scripts/mt-digest/package.json
-
       - name: Install dependencies
         working-directory: scripts/mt-digest
         run: npm install
-
       - name: Run digest
         working-directory: scripts/mt-digest
         env:
@@ -41,5 +34,5 @@ jobs:
           GMAIL_USER:         ${{ secrets.GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           RECIPIENT_EMAIL:    ${{ vars.RECIPIENT_EMAIL }}
-          LOOKBACK_DAYS:      ${{ github.event.inputs.lookback_days || '1' }}
+          LOOKBACK_DAYS:      ${{ github.event.inputs.lookback_days || '3' }}
         run: node digest.js
